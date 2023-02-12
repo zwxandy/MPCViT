@@ -329,6 +329,8 @@ parser.add_argument('--retrain-mode', action='store_true', default=False,
                     help='switch to retrain mode')
 parser.add_argument('--search-mode', action='store_true', default=False,
                     help='switch to search mode')
+parser.add_argument('--model-checkpoint', default='', type=str,
+                    help='path to inference model checkpoint')
 
 
 def _parse_args():
@@ -348,7 +350,7 @@ def _parse_args():
     return args, args_text
 
 
-def main(inference_model: str):
+def main():
     setup_default_logging()
     args, args_text = _parse_args()
 
@@ -658,8 +660,8 @@ def main(inference_model: str):
             f.write(args_text)
 
     try:
-        # Here, I load the trained ViT model
-        checkpoint = torch.load(inference_model)
+        # Here, I load the trained ViT model to infer
+        checkpoint = torch.load(args.model_checkpoint)
         model.load_state_dict(checkpoint['state_dict'], strict=False)
         model.cuda()
         model.eval()
@@ -740,6 +742,5 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
     return metrics
 
-
 if __name__ == '__main__':
-    main(inference_model='./output/train/tinyimagenet-vit_9_12_64-64-headwise(s=0.5+TFS)(lambda=1e-5)-kd/model_best.pth.tar')
+    main()

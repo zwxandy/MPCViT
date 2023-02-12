@@ -276,7 +276,7 @@ parser.add_argument('--log-interval', type=int, default=50, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                     help='how many batches to wait before writing recovery checkpoint')
-parser.add_argument('--checkpoint-hist', type=int, default=10, metavar='N',
+parser.add_argument('--checkpoint-hist', type=int, default=5, metavar='N',
                     help='number of checkpoints to keep (default: 10)')
 parser.add_argument('-j', '--workers', type=int, default=8, metavar='N',
                     help='how many training processes to use (default: 1)')
@@ -317,10 +317,8 @@ parser.add_argument('--use-kd', action='store_true', default=False,
                     help='whether use KD during finetuning or not')
 parser.add_argument('--use-token-kd', action='store_true', default=False,
                     help='whether to use token level kd')
-parser.add_argument('--L0-SPARSITY', default=0.7, type=float, 
-                    help='the ratio of relu+norm attention')
-parser.add_argument('--finetune-epoch', default=300, type=int,
-                    help='number of epochs to finetune')
+parser.add_argument('--rs-ratio', default=0.7, type=float, 
+                    help='the ratio of ReLUSoftmax attention')
 parser.add_argument('--kd-alpha', default=1.0, type=float,
                     help='KD alpha, soft loss portion (default: 1.0)')
 parser.add_argument('--kd-type', type=str, default="last",
@@ -329,6 +327,12 @@ parser.add_argument('--retrain-mode', action='store_true', default=False,
                     help='switch to retrain mode')
 parser.add_argument('--search-mode', action='store_true', default=False,
                     help='switch to search mode')
+parser.add_argument('--search-checkpoint', default=None, type=str, 
+                    help='checkpoint of the searched model')
+parser.add_argument('--teacher-checkpoint', default=None, type=str, 
+                    help='checkpoint of the teacher model')
+parser.add_argument('--use-linear-scalattn', action='store_true', default=False,
+                    help='whether use linear scaling attention to reduce computation')
 
 
 def _parse_args():
@@ -521,7 +525,7 @@ def main():
         _logger.info('Scheduled epochs: {}'.format(num_epochs))
 
     
-    # sticker: create the train and eval datasets for cifar
+    # zwx: create the train and eval datasets for cifar
     dataset_train = create_dataset(
         name=args.dataset,
         root=args.data_dir, split=args.train_split, is_training=True,
@@ -553,7 +557,7 @@ def main():
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
     
-    # sticker: create dataloaders for train and val with transforms
+    # zwx: create dataloaders for train and val with transforms
     loader_train = create_loader(
         dataset_train,
         input_size=data_config['input_size'],
@@ -597,9 +601,9 @@ def main():
         pin_memory=args.pin_mem,
     )
 
-    ## addcode-start: create dataloader for Tiny-ImageNet/ImageNet
+    ## zwx: create dataloader for Tiny-ImageNet/ImageNet
     if 'imagenet' in args.data_dir:
-        print('Loading TinyImageNet dataset...')
+        print('>>>>>> Loading TinyImageNet Dataset <<<<<<')
         data_transforms = {
             'train': transforms.Compose([
                 transforms.RandomHorizontalFlip(),
@@ -627,8 +631,7 @@ def main():
         loader_eval = DataLoader(dataset=dataset_eval, batch_size=args.batch_size, \
             pin_memory=args.pin_mem, num_workers=args.workers, sampler=eval_sampler, shuffle=False)
     else:
-        print('Loading Cifar-10/100 dataset...')
-    ## addcode-end
+        print('>>>>>> Loading CIFAR-10/100 Dataset <<<<<<')
 
     # setup loss function
     if args.jsd:
@@ -672,44 +675,46 @@ def main():
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
-    # manually define which layers use relu+norm or scaling attention
-    # for name, param in model.named_parameters():
-    #     if 'alpha' in name:
-    #         param.requires_grad = False
-    #     if 'alpha' in name and '0' in name:
-    #         param.data = torch.tensor(1.0).cuda()
-    #     if 'alpha' in name and '1' in name:
-    #         param.data = torch.tensor(1.0).cuda()
-    #     if 'alpha' in name and '2' in name:
-    #         param.data = torch.tensor(1.0).cuda()
-    #     if 'alpha' in name and '3' in name:
-    #         param.data = torch.tensor(1.0).cuda()
-    #     if 'alpha' in name and '4' in name:
-    #         param.data = torch.tensor(1.0).cuda()
-    #     if 'alpha' in name and '5' in name:
-    #         param.data = torch.tensor(0.0).cuda()
-    #     if 'alpha' in name and '6' in name:
-    #         param.data = torch.tensor(0.0).cuda()
-    #     if 'alpha' in name:
-    #         print(name, param, param.requires_grad)
+    """
+    # zwx: manually define which layers use ReLUSoftmax or ScalAttn
+    for name, param in model.named_parameters():
+        if 'alpha' in name:
+            param.requires_grad = False
+        if 'alpha' in name and '0' in name:
+            param.data = torch.tensor(1.0).cuda()
+        if 'alpha' in name and '1' in name:
+            param.data = torch.tensor(1.0).cuda()
+        if 'alpha' in name and '2' in name:
+            param.data = torch.tensor(1.0).cuda()
+        if 'alpha' in name and '3' in name:
+            param.data = torch.tensor(1.0).cuda()
+        if 'alpha' in name and '4' in name:
+            param.data = torch.tensor(1.0).cuda()
+        if 'alpha' in name and '5' in name:
+            param.data = torch.tensor(0.0).cuda()
+        if 'alpha' in name and '6' in name:
+            param.data = torch.tensor(0.0).cuda()
+        if 'alpha' in name:
+            print(name, param, param.requires_grad)
+    """
 
     try:
-        # sticker: train and validate the model in evey epochs
+        # zwx: train and validate the model in evey epochs
         for epoch in range(start_epoch, num_epochs):
             if args.retrain_mode:
-                print('It is not in the searching mode now!')
+                print('>>>>>> Not In Search Mode <<<<<<')
                 break
             elif args.search_mode:
-                print('The mode of searching!')
+                print('>>>>>> In Search Mode <<<<<<')
             else:
-                print('The mode of running baseline!')
+                print('>>>>>> In Baseline Mode <<<<<<')
 
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
 
-            # sticker: train the model
+            # zwx: train the model
             time_train_start = time.time()
-            train_metrics = train_one_epoch(
+            train_metrics = search_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
@@ -721,7 +726,7 @@ def main():
                     _logger.info("Distributing BatchNorm running means and vars")
                 distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
-            # sticker: validate the model
+            # zwx: validate the model
             eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
 
             if model_ema is not None and not args.model_ema_force_cpu:
@@ -746,43 +751,40 @@ def main():
                 save_metric = eval_metrics[eval_metric]
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
 
-
-        ## remove unimportant ReLUs and directly inference after training
+        # zwx: remove relatively unimportant RSAttn
         if not args.retrain_mode:
-            print('It is not in the retraining mode now!')
+            print('>>>>>> Not In Retrain Mode <<<<<<')
             return 
-        print('The mode of retraining!')
+        print('>>>>>> In Retrain Mode <<<<<<')
 
-        L0_SPARSITY = args.L0_SPARSITY
-        print('Sparsity:', L0_SPARSITY)
+        rs_ratio = args.rs_ratio
+        print('ReLUSoftmax ratio:', rs_ratio)
 
-        # model_path = './output/train/cifar10-vit_7_4_32-32-headwise(search)(lambda=1e-5)/model_best.pth.tar'
-        model_path = './output/train/tinyimagenet-vit_9_12-64-headwise(search)(lambda=1e-5)/model_best.pth.tar'
-        # model_path = './output/train/cifar10-vit_7_4_32-32-rowwise(search)(lambda=1e-5)/model_best.pth.tar'
-        # model_path = './output/train/tinyimagenet-vit_7_4_32-32-headwise(search)-softmax+scaling/model_best.pth.tar'
-        # model_path = './output/train/20221110-180042-vit_7_4_32-32/model_best.pth.tar'
-        checkpoint = torch.load(model_path)
+        checkpoint = torch.load(args.search_checkpoint)
         model.load_state_dict(checkpoint['state_dict'], strict=False)
-        print('Loading searched parameters Done:', model_path)
+        print('Loading searched arch parameters done:', args.search_checkpoint)
+
         alpha_list = []
         for name, param in model.named_parameters():
             if 'alpha' in name:
                 alpha_list.append(param.data.cpu().numpy())
-                param.requires_grad = False
-        print('alpha_list:\n', alpha_list)
+                param.requires_grad = False  # fix alpha during retraining!
+        print('Alpha list:\n', alpha_list)
 
-        ## vit_7_8_32
-        # alpha_layers = np.array(
-        # [[0.8358704447746277, 0.6769393086433411, 0.40329304337501526, 0.2038588970899582, 0.10843390226364136, 0.028780698776245117, 0.027155207470059395, 0.0210544615983963], 
-        #  [0.8995287418365479, 0.8479425311088562, 0.793146014213562, 0.6826027035713196, 0.6163853406906128, 0.42103633284568787, 0.3629750609397888, 0.20174305140972137], 
-        #  [0.809126079082489, 0.7324215769767761, 0.7182744145393372, 0.626101553440094, 0.5895536541938782, 0.5872342586517334, 0.585266649723053, 0.48109060525894165], 
-        #  [0.7795156240463257, 0.7232432961463928, 0.6783273220062256, 0.632444441318512, 0.594129204750061, 0.5589304566383362, 0.49904099106788635, 0.48275625705718994], 
-        #  [0.5584462285041809, 0.5437265634536743, 0.42488521337509155, 0.3754892647266388, 0.361765056848526, 0.35670092701911926,  0.32918888330459595, 0.30420055985450745], 
-        #  [0.3564434051513672, 0.30644503235816956, 0.30508917570114136, 0.29084548354148865, 0.28142666816711426, 0.27740541100502014, 0.2771148085594177, 0.2713855504989624], 
-        #  [0.2799147963523865, 0.2739943861961365, 0.26040032505989075, 0.2483862042427063, 0.23337602615356445, 0.22938238084316254, 0.20324745774269104, 0.196089506149292]])        
-    
-        ## head-wise sparsity (top-k for all heads)
-        print('head-wise in all layers')
+        """
+        # vit_7_8_32
+        alpha_layers = np.array(
+        [[0.8358704447746277, 0.6769393086433411, 0.40329304337501526, 0.2038588970899582, 0.10843390226364136, 0.028780698776245117, 0.027155207470059395, 0.0210544615983963], 
+         [0.8995287418365479, 0.8479425311088562, 0.793146014213562, 0.6826027035713196, 0.6163853406906128, 0.42103633284568787, 0.3629750609397888, 0.20174305140972137], 
+         [0.809126079082489, 0.7324215769767761, 0.7182744145393372, 0.626101553440094, 0.5895536541938782, 0.5872342586517334, 0.585266649723053, 0.48109060525894165], 
+         [0.7795156240463257, 0.7232432961463928, 0.6783273220062256, 0.632444441318512, 0.594129204750061, 0.5589304566383362, 0.49904099106788635, 0.48275625705718994], 
+         [0.5584462285041809, 0.5437265634536743, 0.42488521337509155, 0.3754892647266388, 0.361765056848526, 0.35670092701911926,  0.32918888330459595, 0.30420055985450745], 
+         [0.3564434051513672, 0.30644503235816956, 0.30508917570114136, 0.29084548354148865, 0.28142666816711426, 0.27740541100502014, 0.2771148085594177, 0.2713855504989624], 
+         [0.2799147963523865, 0.2739943861961365, 0.26040032505989075, 0.2483862042427063, 0.23337602615356445, 0.22938238084316254, 0.20324745774269104, 0.196089506149292]])        
+        """
+
+        # head-wise replacement (top-k across all heads)
+        print('Head-wise replacement across all layers')
         alpha_layers = np.zeros((len(alpha_list), alpha_list[0].shape[1]))  # (#layers, #heads)
         for i in range(len(alpha_list)):
             alpha_layer = np.array(alpha_list[i].squeeze()).reshape(-1, 1).transpose(1, 0)  # (1, #heads)
@@ -790,61 +792,68 @@ def main():
         print('alpha_layers:\n', alpha_layers)
         alpha_layers_flatten = alpha_layers.flatten().reshape(1, -1)  # (1, #layers * #heads)
         print('Alpha of all heads in layers:\n', alpha_layers_flatten.tolist())
-        alpha_id_topk = np.argsort(alpha_layers_flatten)[:, int((1 - L0_SPARSITY) * alpha_layers_flatten.shape[1]):]
+        alpha_id_topk = np.argsort(alpha_layers_flatten)[:, int((1 - rs_ratio) * alpha_layers_flatten.shape[1]):]
         print('Top-k alpha id:\n', alpha_id_topk)
         flag_list = np.zeros(alpha_layers_flatten.shape[1])
         flag_list[alpha_id_topk] = 1.0
         flag_list = flag_list.reshape(alpha_layers.shape[0], alpha_layers.shape[1])
-        print('Binarized alpha for each head in layers:\n', flag_list)
+        print('Binarized alpha for all heads:\n', flag_list)
         for j in range(alpha_layers.shape[0]):
             for name, param in model.named_parameters():
                 if 'alpha' in name and str(j) in name:
                     param.data[0, :, 0, 0] = torch.tensor(flag_list[j]).cuda()
-                    param.requires_grad = False
+                    param.requires_grad = False  # fix alpha during retraining!
 
-        # head-wise sparsity (top-k for heads in each layer)
-        # print('head-wise in each layer')
-        # for i in range(len(alpha_list)):
-        #     alpha_layer = alpha_list[i].squeeze()
-        #     alpha_id_sort = np.argsort(alpha_layer)[int((1 - L0_SPARSITY) * len(alpha_layer)):]
-        #     flag_list = np.zeros(len(alpha_layer))
-        #     flag_list[alpha_id_sort] = 1.0
-        #     for name, param in model.named_parameters():
-        #         if 'alpha' in name and str(i) in name:
-        #             param.data[0, :, 0, 0] = torch.tensor(flag_list).cuda()
+        """
+        # Head-wise replacement (top-k for heads within each layer)
+        print('Head-wise replacement within each layer')
+        for i in range(len(alpha_list)):
+            alpha_layer = alpha_list[i].squeeze()
+            alpha_id_sort = np.argsort(alpha_layer)[int((1 - rs_ratio) * len(alpha_layer)):]
+            flag_list = np.zeros(len(alpha_layer))
+            flag_list[alpha_id_sort] = 1.0
+            for name, param in model.named_parameters():
+                if 'alpha' in name and str(i) in name:
+                    param.data[0, :, 0, 0] = torch.tensor(flag_list).cuda()
+        """
 
-        ## layer-wise sparisity
-        # alpha_id_sort = np.argsort(alpha_list)[int(L0_SPARSITY * len(alpha_list)):]  # little -> large
-        # print(alpha_id_sort)
-        # flag_list = np.zeros(len(alpha_list))
-        # flag_list[alpha_id_sort] = 1
-        # print(flag_list)
-        # for name, param in model.named_parameters():
-        #     for layer in range(len(flag_list)):
-        #         if 'alpha' in name and str(layer) in name:
-        #             param.data = torch.tensor(flag_list[layer]).cuda()
+        """
+        ## Layer-wise replacement
+        print('Layer-wise replacement')
+        alpha_id_sort = np.argsort(alpha_list)[int(rs_ratio * len(alpha_list)):]  # little -> large
+        print(alpha_id_sort)
+        flag_list = np.zeros(len(alpha_list))
+        flag_list[alpha_id_sort] = 1
+        print(flag_list)
+        for name, param in model.named_parameters():
+            for layer in range(len(flag_list)):
+                if 'alpha' in name and str(layer) in name:
+                    param.data = torch.tensor(flag_list[layer]).cuda()
+        """
+                
+        """
+        ## row-wise replacement
+        print('Row-wise replacement')
+        for i in range(len(alpha_list)):
+            alpha_layer = alpha_list[i].squeeze()
+            print('alpha_layer:', alpha_layer.shape)
+            alpha_id_sort = np.argsort(alpha_layer)[int((1 - rs_ratio) * len(alpha_layer)):]
+            print('alpha_id_sort:', alpha_id_sort)
+            flag_list = np.zeros(len(alpha_layer))
+            flag_list[alpha_id_sort] = 1.0
+            print('flag_list:', flag_list)
+            for name, param in model.named_parameters():
+                if 'alpha' in name and str(i) in name:
+                    param.data[0, 0, :, 0] = torch.tensor(flag_list).cuda() 
+                    param.requires_grad = False       
+        """
 
-        ## row-wise sparisity
-        # for i in range(len(alpha_list)):
-        #     alpha_layer = alpha_list[i].squeeze()
-        #     print('alpha_layer:', alpha_layer.shape)
-        #     alpha_id_sort = np.argsort(alpha_layer)[int((1 - L0_SPARSITY) * len(alpha_layer)):]
-        #     print('alpha_id_sort:', alpha_id_sort)
-        #     flag_list = np.zeros(len(alpha_layer))
-        #     flag_list[alpha_id_sort] = 1.0
-        #     print('flag_list:', flag_list)
-        #     for name, param in model.named_parameters():
-        #         if 'alpha' in name and str(i) in name:
-        #             param.data[0, 0, :, 0] = torch.tensor(flag_list).cuda() 
-        #             param.requires_grad = False       
-
-        print('Inferece after directly removing ReLUs...')
+        print('Inferece after removing replacement...')
         eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
-        print('Inference Done!')
 
-        # after removing unimportant ReLUs, we need to retrain (with knowledge distillation) for more epochs
+        # after removing relatively unimportant RSAttn, we retrain (with KD) for higher accuracy
         if args.retrain_mode:
-            print('Loading a new model...')
+            print('Loading a new model:', args.model)
             model = create_model(
                 model_name=args.model,
                 pretrained=args.pretrained,
@@ -864,8 +873,8 @@ def main():
                 for name, param in model.named_parameters():
                     if 'alpha' in name and str(j) in name:
                         param.data[0, :, 0, 0] = torch.tensor(flag_list[j]).cuda()
-                        param.requires_grad = False
-            print('Successfully load the binarized alpha to new model!')
+                        param.requires_grad = False  # fix alpha during retraining!
+            print('Successfully load the binarized arch params into new model!')
             # enlarge the depth before retraining and manually set the attention type
             # for name, param in model.named_parameters():
             #     if 'alpha' in name and ('7' in name or '8' in name):
@@ -878,12 +887,13 @@ def main():
             model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
             checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
 
+        # re-define the optimizer and lr-scheduler
         optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
         lr_scheduler, _ = create_scheduler(args, optimizer)
         
         model_teacher = None
         if args.use_kd or args.use_token_kd:
-            # KD: vit with the best softmax
+            # KD: ViT with the vallina Softmax attention
             model_teacher = create_model(
                 model_name=args.model+'_teacher',
                 pretrained=args.pretrained,
@@ -899,22 +909,19 @@ def main():
                 bn_eps=args.bn_eps,
                 scriptable=args.torchscript,
                 checkpoint_path='')
-            teacher_path = './output/train/tinyimagenet-vit_9_12-origin(patchsize=16)/model_best.pth.tar'
-            # teacher_path = './output/train/cifar10-vit_7_4_32-32-origin(600epochs)/model_best.pth.tar'
-            checkpoint = torch.load(teacher_path)
+            checkpoint = torch.load(args.teacher_checkpoint)
             model_teacher.load_state_dict(checkpoint['state_dict'], strict=False)
             model_teacher.cuda()
-            print('Loading teacher model best weights done:', teacher_path)
+            print('Loading teacher model done:', args.model + '_teacher', args.teacher_checkpoint)
             model_teacher.eval()
             print('Verifying the teacher model...')
             eval_metrics = validate(model_teacher, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
 
-        print('Start to retrain the sparsified model...')
-        # for epoch in range(num_epochs, num_epochs + finetune_epoch): 
-        for epoch in range(start_epoch, num_epochs):  # retrain the sparsified model
+        print('Start to retrain the heterogeneous model...')
+        for epoch in range(start_epoch, num_epochs):
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
-            # sticker: finetune the model
+
             time_train_start = time.time()
 
             train_metrics = retrain_one_epoch(
@@ -930,7 +937,7 @@ def main():
                     _logger.info("Distributing BatchNorm running means and vars")
                 distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
-            # sticker: validate the finetuned model
+            # zwx: validate the retrained model
             eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
 
             if model_ema is not None and not args.model_ema_force_cpu:
@@ -962,7 +969,7 @@ def main():
         _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
 
 
-def train_one_epoch(
+def search_one_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
         lr_scheduler=None, saver=None, output_dir=None, amp_autocast=suppress,
         loss_scaler=None, model_ema=None, mixup_fn=None):
@@ -982,6 +989,12 @@ def train_one_epoch(
     end = time.time()
     last_idx = len(loader) - 1
     num_updates = epoch * len(loader)
+
+    if args.search_mode:
+        for name, param in model.named_parameters():
+            if 'alpha' in name:
+                print(name, param.data.cpu().numpy().squeeze(), 'grad:', param.requires_grad)
+
     for batch_idx, (input, target) in enumerate(loader):
         alpha_list = []
         reg_loss = 0
@@ -992,11 +1005,6 @@ def train_one_epoch(
                 reg_loss += torch.norm(param, p=1)
         alpha_sum = sum(alpha_list)
         # print(alpha_list)
-
-        if args.search_mode:
-            for name, param in model.named_parameters():
-                if 'alpha' in name:
-                    print(name, param.data.cpu().numpy().squeeze(), param.requires_grad)
 
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
@@ -1171,9 +1179,10 @@ def retrain_one_epoch(
 
     model.train()
 
-    for name, param in model.named_parameters():
-            if 'alpha' in name:
-                print(name, param.data.cpu().numpy().squeeze(), param.requires_grad)
+    if args.retrain_mode:
+        for name, param in model.named_parameters():
+                if 'alpha' in name:
+                    print(name, param.data.cpu().numpy().squeeze(), 'grad:', param.requires_grad)
 
     end = time.time()
     last_idx = len(loader) - 1
@@ -1192,8 +1201,8 @@ def retrain_one_epoch(
             output = model(input)
             if args.use_kd or args.use_token_kd:
                 output_teacher = model_teacher(input)
-                loss = loss_fn(output, output_teacher)
-                loss_fn_hard = SoftTargetCrossEntropy().cuda()
+                loss = loss_fn(output, output_teacher)  # soft loss of KD
+                loss_fn_hard = SoftTargetCrossEntropy().cuda()  # hard loss of logists
                 output = output[0] if isinstance(output, tuple) else output
                 loss = loss + loss_fn_hard(output, target)
             else:
