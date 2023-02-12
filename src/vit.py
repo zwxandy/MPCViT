@@ -177,7 +177,7 @@ def vit_6(*args, **kwargs):
                      *args, **kwargs)
 
 
-## vit setting for cifar-10 and cifar-100
+# ViT arch for cifar-10/100
 def vit_7(*args, **kwargs):
     return _vit_lite(num_layers=7, num_heads=4, mlp_ratio=2, embedding_dim=256,
                      *args, **kwargs)
@@ -193,7 +193,7 @@ def vit_7_teacher(*args, **kwargs):
                      *args, **kwargs)
 
 
-## vit setting for tiny-imagenet
+## ViT arch for tiny-imagenet
 def vit_9(*args, **kwargs):
     return _vit_lite(num_layers=9, num_heads=12, mlp_ratio=2, embedding_dim=192,
                      *args, **kwargs)
