@@ -13,7 +13,7 @@ First, we leverage the idea of differentiable architecture search (DARTS) to sea
 python train.py --config configs/datasets/cifar10.yml --model vit_7_4_32 /path/to/cifar-10 --search-mode --epochs 300
 ```
 
-### Retrain the heterogenuous ViT 
+### Retrain the heterogeneous ViT 
 After searching, we obtain the trained architecture parameters. We structurally select a part of attention as RSAttn and the other part as ScalAttn according to the RSAttn ratio.
 ```shell
 python train.py --config configs/datasets/cifar10.yml --model vit_7_4_32 /path/to/cifar-10 --retrain-mode --epochs 300 --search-checkpoint output/train/path/model_best.pth.tar --rs-ratio 0.7

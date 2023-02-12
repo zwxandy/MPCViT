@@ -31,28 +31,8 @@ class Attention(Module):
         self.attn_drop = Dropout(attention_dropout)
         self.proj = Linear(dim, dim)  # try to extend
         self.proj_drop = Dropout(projection_dropout)
-
-        ## addcode-start ##
-        self.qkv_expand = Sequential(
-            Linear(dim, dim * 6, bias=False), 
-            Linear(dim * 6, dim * 3, bias=False)
-            # immediate nonlinear function (relu)
-        )
-        self.proj_expand = Sequential(
-            Linear(dim, 4 * dim),
-            Linear(4 * dim, 1 * dim)
-            # 1 -> 4 -> 1
-            # immediate nonlinear function (relu)
-        )
-        self.dw_conv = Conv2d(in_channels=256, out_channels=256, kernel_size=3,\
-            stride=1, padding=1, groups=256, bias=False)
-        self.W = Parameter(torch.zeros(size=(1, 256, 64, 64)), requires_grad=True)  # (batch_size, channel, HW, HW) 
-        # batch_size=128 -> cuda out of memory. Here set 1 and broadcast to batch_size (less parameters)
-        init.xavier_uniform_(self.W.data, gain=1.414)
-        self.kernel_s = Parameter(torch.zeros(self.num_heads, 1, 3, 3),  requires_grad=True)  
-        # follow the rule: dwconv -> (out_channels, 1, K, K)
-        self.kernel_o = Parameter(torch.zeros(1, 1, 3, 3), requires_grad=False)
-        
+  
+        ## Exploration of different attention variants
         # self.hardtanh = Hardtanh(min_val= 0.5, max_val=1.5)
         # self.gamma_xnorm = Parameter(torch.randn((1, num_heads, 1, 1)))
         # self.relu6 = ReLU6()
@@ -71,43 +51,38 @@ class Attention(Module):
         # self.alpha = Parameter(torch.ones(1, 1, 65, 1), requires_grad=True)  # row-wise search
         self.alpha.data.fill_(1.0)
         self.kk = 77
-        # self.E = Parameter(torch.zeros(1, 1, self.kk, 65))
-        self.E = Parameter(torch.zeros(1, 1, self.kk, 257))
+        self.E = Parameter(torch.zeros(1, 1, self.kk, 65))
         init.xavier_uniform_(self.E.data, gain=1.414)
-        ## addcode-end ##
 
     def forward(self, x):
         B, N, C = x.shape  # x: (B, HW + 1, C)
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # q/k/v: (B, #heads, HW + 1, C // #heads)
 
-        ## original dot product attention ##
+        '''
+        # LinFormer
+        k = self.E @ k
+        v = self.E @ v
+        '''
 
-        ## LinFormer
-        # k = self.E @ k
-        # v = self.E @ v
-
-        # attn_ = (q @ k.transpose(-2, -1))
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        # attn = attn.softmax(dim=-1)  # attn: (B, #heads, HW + 1, HW + 1)
+        # attn = attn.softmax(dim=-1)  # attn: (B, #heads, HW + 1, HW + 1) - Vallina Attention
 
-        # attn = attn ** 2
-
-        attn_scaling = attn / attn.size(3)
+        scalattn = attn / attn.size(3)  # scaling attention
         attn = self.relu(attn)
-        attn = attn / (torch.sum(attn, dim=-1, keepdim=True) + self.eps)
+        attn = attn / (torch.sum(attn, dim=-1, keepdim=True) + self.eps)  # ReLUSoftmax attention
 
-        ## print('Execute ReLU + Norm') if self.alpha == 1 else print('Execute Scaling Attention')
-        attn = self.alpha * attn + (1 - self.alpha) * attn_scaling
+        # print('Execute ReLUSoftmax') if self.alpha == 1 else print('Execute Scaling Attention')
+        attn = self.alpha * attn + (1 - self.alpha) * scalattn  # weighted-sum for arch searching
 
         attn = self.attn_drop(attn)
         x = (attn @ v).transpose(1, 2)
         x = x.reshape(B, N, C)  # x: (B, HW + 1, C)
 
-        use_linear_scaling = False
-        if use_linear_scaling:
-            x_attn_scaling = (q / math.sqrt(N)) @ (k.transpose(-2, -1) / math.sqrt(N) @ v) * self.scale
-            x_attn_scaling = x_attn_scaling.transpose(1, 2).reshape(B, N, C)
+        use_linear_scalattn = False  # reduce the computation of scalattn
+        if use_linear_scalattn:
+            x_scalattn = (q / math.sqrt(N)) @ (k.transpose(-2, -1) / math.sqrt(N) @ v) * self.scale
+            x_scalattn = x_scalattn.transpose(1, 2).reshape(B, N, C)
             attn_relu = self.relu((q @ k.transpose(-2, -1)) * self.scale)
             attn_relu = attn_relu / (torch.sum(attn_relu, dim=-1, keepdim=True) + self.eps)
             attn_relu = self.attn_drop(attn_relu)
@@ -115,93 +90,36 @@ class Attention(Module):
             if self.alpha.shape[1] == self.num_heads:
                 self.alpha.data = torch.repeat_interleave(self.alpha.data, C // self.num_heads, dim=1)
                 self.alpha.data = self.alpha.data.squeeze().unsqueeze(0).unsqueeze(0)
-            x = self.alpha * x_attn_relu + (1 - self.alpha) * x_attn_scaling
+            x = self.alpha * x_attn_relu + (1 - self.alpha) * x_scalattn
+        
+        '''
+        # XNorm Attention
+        kv = k.transpose(-2, -1) @ v  # kv: (B, #heads, C // #heads, C // #heads)
+        kv_normed = self.XNorm(kv, self.gamma_xnorm)  # kv_normed: (B, #heads, C // #heads, C // #heads)
+        q_normed = self.XNorm(q, self.gamma_xnorm)  # q_normed: (B, #heads, HW + 1, C // #heads)
+        x = (q_normed @ kv_normed).transpose(1, 2).reshape(B, N, C)  # x: (B, HW + 1, C)
+        '''
 
-        ## addcode-start: XNorm Attention ##
-        # kv = k.transpose(-2, -1) @ v  # kv: (B, #heads, C // #heads, C // #heads)
-        # kv_normed = self.XNorm(kv, self.gamma_xnorm)  # kv_normed: (B, #heads, C // #heads, C // #heads)
-        # q_normed = self.XNorm(q, self.gamma_xnorm)  # q_normed: (B, #heads, HW + 1, C // #heads)
-        # x = (q_normed @ kv_normed).transpose(1, 2).reshape(B, N, C)  # x: (B, HW + 1, C)
-        ## addcode-end ##
-
-        # addcode-start: Hydra Attention (cosine similarity) ##
-        # q/k/v: (B, HW+1, #heads), #heads = #channels
-        # k = k.squeeze(-1).transpose(-2, -1)
-        # q = q.squeeze(-1).transpose(-2, -1)
-        # v = v.squeeze(-1).transpose(-2, -1)
-        # q = q / q.norm(dim=-1, keepdim=True)
-        # k = k / k.norm(dim=-1, keepdim=True)
-        # kv = (k * v).sum(dim=-2, keepdim=True)
-        # x = q * kv  # x: (B, HW + 1, C)
-        # addcode-end ##
-
-        ## addcode-start ##
-        # v_t = v.transpose(-2, -1).flatten(1, 2)
-        # clf_token = v_t[:, :, 0]
-        # v_t_dropclf = v_t[:, :, 1:].reshape(-1, C, int(math.sqrt(N)), int(math.sqrt(N)))
-
-        ## Operation1: Depth-wise convolution
-        # v_conv = self.dw_conv(v_t_dropclf)
-        # v_conv_flatten = v_conv.flatten(-2, -1)
-        # conv_output = torch.cat((v_conv_flatten, clf_token.unsqueeze(2)), dim=2).transpose(-1, -2)
-        # x = x + conv_output
-
-        ## Operation2: compute DWConv with a trainable W
-        # out = (self.W @ (v_t[:, :, 1:].unsqueeze(3))).squeeze(3)
-        # out_cat = torch.cat((out, clf_token.unsqueeze(2)), dim=2).transpose(-1, -2)
-        # # x = x + out_cat
-
-        ## Operation3: Weight-sharing depth-wise convolution for each head
-        # kernel_m = torch.repeat_interleave(self.kernel_s, C // self.num_heads, dim=0)
-        # out_list = list()
-        # for h in range(self.num_heads):            
-        #     kernel = kernel_m[h * C // self.num_heads:(h + 1) * (C // self.num_heads)]
-        #     v_h = v[:, h, :, :].transpose(-1, -2)  # v_h: (B, C // #heads, HW + 1)
-        #     clf_token = v_h[:, :, 0]
-        #     v_h_dropclf = v_h[:, :, 1:].reshape(-1, C // self.num_heads, int(math.sqrt(N)), int(math.sqrt(N)))
-        #     dwconv_in_head = F.conv2d(input=v_h_dropclf, weight=kernel, bias=None, stride=1, padding=1, groups=C//self.num_heads)
-        #     dwconv_in_head_flatten = dwconv_in_head.flatten(-2, -1)
-        #     output_in_head = torch.cat((dwconv_in_head_flatten, clf_token.unsqueeze(2)), dim=2).transpose(-1, -2)
-        #     out_list.append(output_in_head)
-        # output = torch.cat(out_list, dim=-1)  # now have the same dimension with attn output
-        # x = x + output
-
-        ## Operation4: Weight-sharing depth-wise convolution for all channels
-        # kernel_m = torch.repeat_interleave(self.kernel_o, C, dim=0)
-        # dwconv = F.conv2d(input=v_t_dropclf, weight=kernel_m, bias=None, stride=1, padding=1, groups=C)
-        # dwconv_flatten = dwconv.flatten(-2, -1)
-        # output = torch.cat((dwconv_flatten, clf_token.unsqueeze(2)), dim=2).transpose(-1, -2)
-        # x = x + output
-
-        ## addcode-ends ##
+        '''
+        # Hydra Attention (cosine similarity)
+        q/k/v: (B, HW+1, #heads), #heads = #channels
+        k = k.squeeze(-1).transpose(-2, -1)
+        q = q.squeeze(-1).transpose(-2, -1)
+        v = v.squeeze(-1).transpose(-2, -1)
+        q = q / q.norm(dim=-1, keepdim=True)
+        k = k / k.norm(dim=-1, keepdim=True)
+        kv = (k * v).sum(dim=-2, keepdim=True)
+        x = q * kv  # x: (B, HW + 1, C)
+        '''
 
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-    
-    ## addcode-start: construct the weight_matrix ##
-    # def get_weight_matrix(self, H, W, batch_size, channel, dw_kernel):
-    #     id_map = torch.arange(H * W).reshape(H, W)
-    #     id_map_repeat = id_map.repeat(batch_size, channel, 1, 1)
-    #     id_map_pad = F.pad(input=id_map_repeat, pad=[1, 1, 1, 1], mode="constant", value=-1)
-    #     row = 0
-    #     weight_mx = torch.zeros(batch_size, channel, H * W, H * W)
-    #     for i in range(W):
-    #         for j in range(H):
-    #             input_conv = id_map_pad[0, 0, i:i+3, j:j+3]
-    #             loc_on_weight = input_conv[torch.where(input_conv != -1)]
-    #             for k in loc_on_weight:
-    #                 weight_mx[:, :, row, k] = dw_kernel[:, 0, torch.where(input_conv == k)[0], torch.where(input_conv == k)[1]]\
-    #                     .squeeze(1).repeat(batch_size, 1)
-    #             row += 1
-    #     return weight_mx
-    ## addcode-end ##
 
-    ## addcode-start: XNorm ##
+    # XNorm
     def XNorm(self, x, gamma_xnorm):
         norm_tensor = torch.norm(x, 2, -1, True)
         return x * gamma_xnorm / norm_tensor
-    ## addcode-end ##
 
 
 class MaskedAttention(Module):
@@ -262,73 +180,12 @@ class TransformerEncoderLayer(Module):
 
         self.activation = F.gelu
 
-        ## addcode-start: expand the fc layer (linear1) ##
-        ratio_expand = int(2)
-        self.linear_expand =  Sequential(
-            Linear(d_model, ratio_expand * d_model),
-            Linear(ratio_expand * d_model, dim_feedforward)
-        )
-        ## addcode-end ##
-
     def forward(self, src: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        # print(self.pre_norm(src).shape)
         src = src + self.drop_path(self.self_attn(self.pre_norm(src)))
         src = self.norm1(src)
-
-        ## addcode-start ##
-        is_expand = False
-        is_inference = False
-        if is_expand and not is_inference:  # training time
-            src2 = self.linear2(self.dropout1(self.activation(self.linear_expand(src))))
-        elif is_expand and is_inference:  # infernece time
-            tmp = self.fuse_fc(self.linear_expand[0], self.linear_expand[1])
-            self.linear1.weight.data, self.linear1.bias.data = tmp['weight'], tmp['bias']
-            src2 = self.linear2(self.dropout1(self.activation(self.linear1(src))))
-            # may occur this bug: "Attempting to unscale FP16 gradients."
-            # solution: set torch.cuda.amp/grad_scaler.py/_unscale_grads_() allow_fp16=True
-        ## addcode-end ##
-        if not is_expand:
-            src2 = self.linear2(self.dropout1(self.activation(self.linear1(src))))  # original line
-
+        src2 = self.linear2(self.dropout1(self.activation(self.linear1(src))))
         src = src + self.drop_path(self.dropout2(src2))
         return src
-    
-    ## addcode-start: fuse two fc layers ##
-    def fuse_fc(self, fc1: Linear, fc2: Linear):
-        """
-        Fuse equivalent weight from two fc layers
-        :param dim_in: m
-        :param dim_out: n
-        :param dim_immediate: p
-        :param s_1: p * m
-        :param s_2: n * p
-        :return: fused weight m * n and bias
-        """
-        if isinstance(fc1, Linear):
-            w_s_1 = fc1.weight
-            b_s_1 = fc1.bias
-        else:
-            w_s_1 = fc1['weight']
-            b_s_1 = fc1['bias']
-
-        if isinstance(fc2, Linear):
-            w_s_2 = fc2.weight
-            b_s_2 = fc2.bias
-        else:
-            w_s_2 = fc2['weight']
-            b_s_2 = fc2['bias']
-
-        if b_s_1 is not None and b_s_2 is not None:
-            new_bias = torch.matmul(w_s_2, b_s_1) + b_s_2
-        elif b_s_1 is None:
-            new_bias = b_s_2  # without bias1
-        else:
-            new_bias = None
-
-        new_weight = torch.matmul(w_s_2, w_s_1)
-
-        return {'weight': new_weight, 'bias': new_bias}
-        ## addcode-end ##
 
 
 class MaskedTransformerEncoderLayer(Module):
@@ -418,14 +275,6 @@ class TransformerClassifier(Module):
         self.fc = Linear(embedding_dim, num_classes)
         self.apply(self.init_weight)
 
-        ## addcode-start: expand the fc layer ##
-        ratio_expand = int(2)
-        self.fc_expand =  Sequential(
-            Linear(embedding_dim, ratio_expand * embedding_dim),
-            Linear(ratio_expand * embedding_dim, num_classes)
-        )
-        ## addcode-end ##
-
     def forward(self, x):
         # print('x:', x.shape)
         if self.positional_emb is None and x.size(1) < self.sequence_length:
@@ -453,60 +302,9 @@ class TransformerClassifier(Module):
             x = torch.matmul(F.softmax(self.attention_pool(x), dim=1).transpose(-1, -2), x).squeeze(-2)
         else:
             x = x[:, 0]  # fetech the classification token
-
-        ## addcode-start ##
-        is_expand = False
-        is_inference = False
-        if is_expand and not is_inference:  # training time
-            x = self.fc_expand(x)
-        elif is_expand and is_inference:  # infernece time
-            tmp = self.fuse_fc(self.fc_expand[0], self.fc_expand[1])
-            self.fc.weight.data, self.fc.bias.data = tmp['weight'], tmp['bias']
             x = self.fc(x)
-            # may occur this bug: "Attempting to unscale FP16 gradients."
-            # solution: set torch.cuda.amp/grad_scaler.py/_unscale_grads_() allow_fp16=True
-        ## addcode-end ##
-        if not is_expand:
-            x = self.fc(x)  # original line
 
         return x, features
-
-    ## addcode-start: fuse two fc layers ##
-    def fuse_fc(self, fc1: Linear, fc2: Linear):
-        """
-        Fuse equivalent weight from two fc layers
-        :param dim_in: m
-        :param dim_out: n
-        :param dim_immediate: p
-        :param s_1: p * m
-        :param s_2: n * p
-        :return: fused weight m * n and bias
-        """
-        if isinstance(fc1, Linear):
-            w_s_1 = fc1.weight
-            b_s_1 = fc1.bias
-        else:
-            w_s_1 = fc1['weight']
-            b_s_1 = fc1['bias']
-
-        if isinstance(fc2, Linear):
-            w_s_2 = fc2.weight
-            b_s_2 = fc2.bias
-        else:
-            w_s_2 = fc2['weight']
-            b_s_2 = fc2['bias']
-
-        if b_s_1 is not None and b_s_2 is not None:
-            new_bias = torch.matmul(w_s_2, b_s_1) + b_s_2
-        elif b_s_1 is None:
-            new_bias = b_s_2  # without bias1
-        else:
-            new_bias = None
-
-        new_weight = torch.matmul(w_s_2, w_s_1)
-
-        return {'weight': new_weight, 'bias': new_bias}
-    ## addcode-end ##
 
     @staticmethod
     def init_weight(m):
